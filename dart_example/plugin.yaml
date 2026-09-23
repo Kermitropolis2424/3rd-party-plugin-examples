@@ -10,13 +10,13 @@ metadata:
   updateUrl: "https://github.com/Hedon-Haven/3rd-party-plugin-examples/releases/latest/download/tester_external_dart-update.yaml"
 
 providerData:
-  iconUrl: "https://placehold.co/favicon.ico"
-  serviceUrl: "https://example.com"
+  iconUrl: "https://assets-cdn77.xvideos-cdn.com/v3/img/skins/default/logo/xvideos.black.svg"
+  serviceUrl: "https://xvideos.com"
   handleUrls:
-    - "https://example.com/home"
-    - "https://example.com/search"
-    - "https://example.com/video"
-    - "https://example.com/author"
+    - "https://xvideos.com/"
+    - "https://www.xvideos.com/?k="
+    - "https://www.xvideos.com/best/2026-08"
+    - "https://www.xvideos.com/pornstars-index"
 
 initialPageCounts:
   initialHomePage: 0
