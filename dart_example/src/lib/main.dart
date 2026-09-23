@@ -1,39 +1,693 @@
-import "dart:convert";
-import "dart:math";
-
+import 'dart:convert';
 import 'wrapper.dart';
 
-const simulateDelays = false;
+const String instanceHost = "https://xvideos.tv";
+const int pageSize = 12;
 bool progressThumbnailsCancelled = false;
 
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+String _resolveUrl(String? path) {
+  if (path == null || path.isEmpty) return "";
+  if (path.startsWith("http://") || path.startsWith("https://")) return path;
+  return "$instanceHost$path";
+}
+
+Map<String, dynamic> _formatVideoItem(Map<String, dynamic> item) {
+  final channel = item["channel"] as Map<String, dynamic>? ?? {};
+  final account = item["account"] as Map<String, dynamic>? ?? {};
+
+  final likes = (item["likes"] as num?)?.toInt() ?? 0;
+  final dislikes = (item["dislikes"] as num?)?.toInt() ?? 0;
+  final totalRatings = likes + dislikes;
+  final ratingPercent = totalRatings > 0 ? ((likes / totalRatings) * 100).round() : 100;
+
+  return {
+    "iD": item["uuid"]?.toString() ?? item["id"]?.toString() ?? "",
+    "title": item["name"]?.toString() ?? "Untitled",
+    "thumbnail": _resolveUrl(item["thumbnailPath"]?.toString()),
+    "thumbnailHttpHeaders": null,
+    "previewVideo": _resolveUrl(item["previewPath"]?.toString()),
+    "previewVideoHttpHeaders": null,
+    "duration": (item["duration"] as num?)?.toInt() ?? 0,
+    "viewsTotal": (item["views"] as num?)?.toInt() ?? 0,
+    "ratingsPositivePercent": ratingPercent,
+    "maxQuality": 1080,
+    "virtualReality": false,
+    "authorName": channel["displayName"] ?? account["displayName"] ?? "Unknown",
+    "authorID": channel["name"] ?? account["name"] ?? "",
+    "verifiedAuthor": false,
+    "scrapeFailMessage": null,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Core Lifecycle & Routing
+// ---------------------------------------------------------------------------
+
 Future<bool> init() async {
-  if (simulateDelays) await Future.delayed(const Duration(seconds: 2));
-  // read cache file to showcase functionality
-  final result = await readCacheFile("testerInitFile.txt");
-  // Failure -> assume file doesn't yet exist
-  if (result.startsWith("Error:")) {
-    final contents = "random number: ${Random().nextInt(100000)}";
-    final base64Encoded = base64Encode(utf8.encode(contents));
-    await writeCacheFile("testerInitFile.txt", base64Encoded);
-    consoleLog("info", "Created file with contents: $contents");
-  } else {
-    consoleLog(
-      "info",
-      "Read from file: ${String.fromCharCodes(base64Decode(result))}",
-    );
-  }
-  consoleLog("info", "Tester External plugin initialized");
+  consoleLog("info", "xvideos plugin initialized for $instanceHost");
   return true;
 }
 
 Future<bool> runFunctionalityTest() async {
-  if (simulateDelays) await Future.delayed(const Duration(seconds: 2));
-  consoleLog("info", "Functionality test completed");
-  return true;
+  try {
+    final res = await httpRequest("$instanceHost/api/v1/config");
+    return res.status == 200;
+  } catch (e) {
+    consoleLog("error", "Functionality test failed: $e");
+    return false;
+  }
 }
 
 Future<Map<String, dynamic>> parseExternalLink(String uriString) async {
   final uri = Uri.parse(uriString);
+  final segments = uri.pathSegments;
+
+  if (segments.isEmpty) {
+    return {"type": "homePage", "pageCount": 0};
+  }
+
+  // Handles: /w/:id or /videos/watch/:id
+  if (segments.first == "w" && segments.length > 1) {
+    return {"type": "videoPage", "iD": segments[1]};
+  }
+  if (segments.length >= 3 && segments[0] == "videos" && segments[1] == "watch") {
+    return {"type": "videoPage", "iD": segments[2]};
+  }
+
+  // Handles: /c/:channelName or /video-channels/:channelName
+  if ((segments.first == "c" || segments.first == "video-channels") && segments.length > 1) {
+    return {"type": "authorPage", "iD": segments[1]};
+  }
+
+  // Handles: /search?search=query
+  if (segments.first == "search" && uri.queryParameters.containsKey("search")) {
+    return {
+      "type": "searchResultsPage",
+      "searchRequest": {
+        "searchString": uri.queryParameters["search"] ?? "",
+      },
+      "pageCount": 0,
+    };
+  }
+
+  return {"type": "unknown"};
+}
+
+// ---------------------------------------------------------------------------
+// Feeds & Search
+// ---------------------------------------------------------------------------
+
+Future<List<Map<String, dynamic>>> getHomePage(int page) async {
+  final start = page * pageSize;
+  final url = "$instanceHost/api/v1/videos?start=$start&count=$pageSize&sort=-publishedAt";
+
+  try {
+    final response = await httpRequest(url);
+    if (response.status != 200) return [];
+
+    final data = jsonDecode(response.body) as Map<String, dynamic>;
+    final List items = data["data"] as List? ?? [];
+
+    return items.map((item) => _formatVideoItem(item as Map<String, dynamic>)).toList();
+  } catch (e) {
+    consoleLog("error", "getHomePage failed: $e");
+    return [];
+  }
+}
+
+Future<List<Map<String, dynamic>>> getSearchResults(
+  Map<String, dynamic> request,
+  int page,
+) async {
+  final query = Uri.encodeQueryComponent(request["searchString"] ?? "");
+  final start = page * pageSize;
+  final url = "$instanceHost/api/v1/search/videos?search=$query&start=$start&count=$pageSize";
+
+  try {
+    final response = await httpRequest(url);
+    if (response.status != 200) return [];
+
+    final data = jsonDecode(response.body) as Map<String, dynamic>;
+    final List items = data["data"] as List? ?? [];
+
+    return items.map((item) => _formatVideoItem(item as Map<String, dynamic>)).toList();
+  } catch (e) {
+    consoleLog("error", "getSearchResults failed: $e");
+    return [];
+  }
+}
+
+Future<List<String>> getSearchSuggestions(String searchString) async {
+  return [];
+}
+
+// ---------------------------------------------------------------------------
+// Video Details & Playback
+// ---------------------------------------------------------------------------
+
+String getVideoUriFromID(String videoID) => "$instanceHost/w/$videoID";
+
+Future<Map<String, dynamic>> getVideoMetadata(
+  String videoId,
+  dynamic uvp,
+) async {
+  final url = "$instanceHost/api/v1/videos/$videoId";
+
+  try {
+    final response = await httpRequest(url);
+    if (response.status != 200) {
+      return {"iD": videoId, "scrapeFailMessage": "HTTP ${response.status}"};
+    }
+
+    final data = jsonDecode(response.body) as Map<String, dynamic>;
+    final channel = data["channel"] as Map<String, dynamic>? ?? {};
+    final account = data["account"] as Map<String, dynamic>? ?? {};
+
+    // Extract HLS playlist and standard MP4 streaming files
+    final Map<int, String> streamUris = {};
+    final streamingPlaylists = data["streamingPlaylists"] as List? ?? [];
+    for (final playlist in streamingPlaylists) {
+      final playlistUrl = playlist["playlistUrl"]?.toString();
+      if (playlistUrl != null && playlistUrl.isNotEmpty) {
+        streamUris[1080] = _resolveUrl(playlistUrl);
+      }
+    }
+
+    if (streamUris.isEmpty) {
+      final files = data["files"] as List? ?? [];
+      for (final file in files) {
+        final resObj = file["resolution"] as Map<String, dynamic>?;
+        final res = (resObj?["id"] as num?)?.toInt() ?? 0;
+        final fileUrl = file["fileUrl"]?.toString();
+        if (fileUrl != null && res > 0) {
+          streamUris[res] = _resolveUrl(fileUrl);
+        }
+      }
+    }
+
+    final likes = (data["likes"] as num?)?.toInt() ?? 0;
+    final dislikes = (data["dislikes"] as num?)?.toInt() ?? 0;
+    DateTime? publishedDate;
+    if (data["publishedAt"] != null) {
+      publishedDate = DateTime.tryParse(data["publishedAt"].toString());
+    }
+
+    return {
+      "iD": videoId,
+      "m3u8Uris": streamUris,
+      "title": data["name"]?.toString() ?? "Untitled",
+      "universalVideoPreview": uvp,
+      "authorID": channel["name"] ?? account["name"] ?? "",
+      "authorName": channel["displayName"] ?? account["displayName"] ?? "Unknown",
+      "authorSubscriberCount": (channel["followersCount"] as num?)?.toInt() ?? 0,
+      "authorAvatar": _resolveUrl(channel["avatar"]?["path"]?.toString()),
+      "actors": [],
+      "description": data["description"]?.toString() ?? "",
+      "viewsTotal": (data["views"] as num?)?.toInt() ?? 0,
+      "tags": (data["tags"] as List? ?? []).map((e) => e.toString()).toList(),
+      "categories": [data["category"]?["label"]?.toString() ?? "General"],
+      "uploadDate": (publishedDate?.millisecondsSinceEpoch ?? 0) ~/ 1000,
+      "ratingsPositiveTotal": likes,
+      "ratingsNegativeTotal": dislikes,
+      "ratingsTotal": likes + dislikes,
+      "virtualReality": false,
+      "chapters": {},
+      "rawHtml": response.body,
+    };
+  } catch (e) {
+    return {"iD": videoId, "scrapeFailMessage": e.toString()};
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Thumbnails & Media Downloads
+// ---------------------------------------------------------------------------
+
+Future<String> downloadThumbnail(
+  String uri,
+  Map<String, String>? thumbnailHttpHeaders,
+) async {
+  try {
+    final response = await httpRequest(uri);
+    return response.status == 200 ? response.body : "";
+  } catch (e) {
+    return "";
+  }
+}
+
+Future<List<String>> getProgressThumbnails(
+  String videoID,
+  dynamic rawHtml,
+) async {
+  return [];
+}
+
+void cancelGetProgressThumbnails() {
+  progressThumbnailsCancelled = true;
+}
+
+// ---------------------------------------------------------------------------
+// Comments, Suggestions & Channels
+// ---------------------------------------------------------------------------
+
+Future<List<Map<String, dynamic>>> getVideoSuggestions(
+  String videoID,
+  dynamic rawHtml,
+  int page,
+) async {
+  // Return trending/recent videos as suggestions
+  return getHomePage(page);
+}
+
+String getCommentUriFromID(String commentID, String videoID) =>
+    "$instanceHost/w/$videoID";
+
+Future<List<Map<String, dynamic>>> getComments(
+  String videoID,
+  dynamic rawHtml,
+  int page,
+) async {
+  final start = page * 10;
+  final url = "$instanceHost/api/v1/videos/$videoID/comment-threads?start=$start&count=10";
+
+  try {
+    final response = await httpRequest(url);
+    if (response.status != 200) return [];
+
+    final data = jsonDecode(response.body) as Map<String, dynamic>;
+    final List threads = data["data"] as List? ?? [];
+
+    return threads.map((item) {
+      final comment = item as Map<String, dynamic>;
+      final account = comment["account"] as Map<String, dynamic>? ?? {};
+
+      DateTime? created;
+      if (comment["createdAt"] != null) {
+        created = DateTime.tryParse(comment["createdAt"].toString());
+      }
+
+      return {
+        "iD": comment["id"]?.toString() ?? "",
+        "videoID": videoID,
+        "author": account["displayName"] ?? account["name"] ?? "Anonymous",
+        "commentBody": comment["text"]?.toString() ?? "",
+        "hidden": false,
+        "authorID": account["name"] ?? "",
+        "countryID": "US",
+        "orientation": null,
+        "profilePicture": _resolveUrl(account["avatar"]?["path"]?.toString()),
+        "ratingsPositiveTotal": null,
+        "ratingsNegativeTotal": null,
+        "ratingsTotal": 0,
+        "commentDate": (created?.millisecondsSinceEpoch ?? 0) ~/ 1000,
+        "replyComments": [],
+        "scrapeFailMessage": null,
+      };
+    }).toList();
+  } catch (e) {
+    return [];
+  }
+}
+
+String getAuthorUriFromID(String authorID) => "$instanceHost/c/$authorID";
+
+Future<Map<String, dynamic>> getAuthorPage(String authorID) async {
+  final url = "$instanceHost/api/v1/video-channels/$authorID";
+
+  try {
+    final response = await httpRequest(url);
+    if (response.status != 200) {
+      return {"iD": authorID, "name": authorID};
+    }
+
+    final data = jsonDecode(response.body) as Map<String, dynamic>;
+
+    return {
+      "iD": authorID,
+      "name": data["displayName"] ?? data["name"] ?? authorID,
+      "avatar": _resolveUrl(data["avatar"]?["path"]?.toString()),
+      "banner": _resolveUrl(data["banner"]?["path"]?.toString()),
+      "aliases": [],
+      "description": data["description"]?.toString() ?? "",
+      "advancedDescription": {},
+      "externalLinks": {},
+      "viewsTotal": (data["views"] as num?)?.toInt() ?? 0,
+      "videosTotal": 0,
+      "subscribers": (data["followersCount"] as num?)?.toInt() ?? 0,
+      "rank": 0,
+      "rawHtml": response.body,
+    };
+  } catch (e) {
+    return {"iD": authorID, "name": authorID};
+  }
+}
+
+Future<List<Map<String, dynamic>>> getAuthorVideos(
+  String authorID,
+  int page,
+) async {
+  final start = page * pageSize;
+  final url = "$instanceHost/api/v1/video-channels/$authorID/videos?start=$start&count=$pageSize";
+
+  try {
+    final response = await httpRequest(url);
+    if (response.status != 200) return [];
+
+    final data = jsonDecode(response.body) as Map<String, dynamic>;
+    final List items = data["data"] as List? ?? [];
+
+    return items.map((item) => _formatVideoItem(item as Map<String, dynamic>)).toList();
+  } catch (e) {
+    consoleLog("error", "getAuthorVideos failed: $e");
+    return [];
+  }
+}
+// Core Lifecycle & Routing
+// ---------------------------------------------------------------------------
+
+Future<bool> init() async {
+  consoleLog("info", "PeerTube plugin initialized for $instanceHost");
+  return true;
+}
+
+Future<bool> runFunctionalityTest() async {
+  try {
+    final res = await httpRequest("$instanceHost/api/v1/config");
+    return res.status == 200;
+  } catch (e) {
+    consoleLog("error", "Functionality test failed: $e");
+    return false;
+  }
+}
+
+Future<Map<String, dynamic>> parseExternalLink(String uriString) async {
+  final uri = Uri.parse(uriString);
+  final segments = uri.pathSegments;
+
+  if (segments.isEmpty) {
+    return {"type": "homePage", "pageCount": 0};
+  }
+
+  // Handles: /w/:id or /videos/watch/:id
+  if (segments.first == "w" && segments.length > 1) {
+    return {"type": "videoPage", "iD": segments[1]};
+  }
+  if (segments.length >= 3 && segments[0] == "videos" && segments[1] == "watch") {
+    return {"type": "videoPage", "iD": segments[2]};
+  }
+
+  // Handles: /c/:channelName or /video-channels/:channelName
+  if ((segments.first == "c" || segments.first == "video-channels") && segments.length > 1) {
+    return {"type": "authorPage", "iD": segments[1]};
+  }
+
+  // Handles: /search?search=query
+  if (segments.first == "search" && uri.queryParameters.containsKey("search")) {
+    return {
+      "type": "searchResultsPage",
+      "searchRequest": {
+        "searchString": uri.queryParameters["search"] ?? "",
+      },
+      "pageCount": 0,
+    };
+  }
+
+  return {"type": "unknown"};
+}
+
+// ---------------------------------------------------------------------------
+// Feeds & Search
+// ---------------------------------------------------------------------------
+
+Future<List<Map<String, dynamic>>> getHomePage(int page) async {
+  final start = page * pageSize;
+  final url = "$instanceHost/api/v1/videos?start=$start&count=$pageSize&sort=-publishedAt";
+
+  try {
+    final response = await httpRequest(url);
+    if (response.status != 200) return [];
+
+    final data = jsonDecode(response.body) as Map<String, dynamic>;
+    final List items = data["data"] as List? ?? [];
+
+    return items.map((item) => _formatVideoItem(item as Map<String, dynamic>)).toList();
+  } catch (e) {
+    consoleLog("error", "getHomePage failed: $e");
+    return [];
+  }
+}
+
+Future<List<Map<String, dynamic>>> getSearchResults(
+  Map<String, dynamic> request,
+  int page,
+) async {
+  final query = Uri.encodeQueryComponent(request["searchString"] ?? "");
+  final start = page * pageSize;
+  final url = "$instanceHost/api/v1/search/videos?search=$query&start=$start&count=$pageSize";
+
+  try {
+    final response = await httpRequest(url);
+    if (response.status != 200) return [];
+
+    final data = jsonDecode(response.body) as Map<String, dynamic>;
+    final List items = data["data"] as List? ?? [];
+
+    return items.map((item) => _formatVideoItem(item as Map<String, dynamic>)).toList();
+  } catch (e) {
+    consoleLog("error", "getSearchResults failed: $e");
+    return [];
+  }
+}
+
+Future<List<String>> getSearchSuggestions(String searchString) async {
+  return [];
+}
+
+// ---------------------------------------------------------------------------
+// Video Details & Playback
+// ---------------------------------------------------------------------------
+
+String getVideoUriFromID(String videoID) => "$instanceHost/w/$videoID";
+
+Future<Map<String, dynamic>> getVideoMetadata(
+  String videoId,
+  dynamic uvp,
+) async {
+  final url = "$instanceHost/api/v1/videos/$videoId";
+
+  try {
+    final response = await httpRequest(url);
+    if (response.status != 200) {
+      return {"iD": videoId, "scrapeFailMessage": "HTTP ${response.status}"};
+    }
+
+    final data = jsonDecode(response.body) as Map<String, dynamic>;
+    final channel = data["channel"] as Map<String, dynamic>? ?? {};
+    final account = data["account"] as Map<String, dynamic>? ?? {};
+
+    // Extract HLS playlist and standard MP4 streaming files
+    final Map<int, String> streamUris = {};
+    final streamingPlaylists = data["streamingPlaylists"] as List? ?? [];
+    for (final playlist in streamingPlaylists) {
+      final playlistUrl = playlist["playlistUrl"]?.toString();
+      if (playlistUrl != null && playlistUrl.isNotEmpty) {
+        streamUris[1080] = _resolveUrl(playlistUrl);
+      }
+    }
+
+    if (streamUris.isEmpty) {
+      final files = data["files"] as List? ?? [];
+      for (final file in files) {
+        final resObj = file["resolution"] as Map<String, dynamic>?;
+        final res = (resObj?["id"] as num?)?.toInt() ?? 0;
+        final fileUrl = file["fileUrl"]?.toString();
+        if (fileUrl != null && res > 0) {
+          streamUris[res] = _resolveUrl(fileUrl);
+        }
+      }
+    }
+
+    final likes = (data["likes"] as num?)?.toInt() ?? 0;
+    final dislikes = (data["dislikes"] as num?)?.toInt() ?? 0;
+    DateTime? publishedDate;
+    if (data["publishedAt"] != null) {
+      publishedDate = DateTime.tryParse(data["publishedAt"].toString());
+    }
+
+    return {
+      "iD": videoId,
+      "m3u8Uris": streamUris,
+      "title": data["name"]?.toString() ?? "Untitled",
+      "universalVideoPreview": uvp,
+      "authorID": channel["name"] ?? account["name"] ?? "",
+      "authorName": channel["displayName"] ?? account["displayName"] ?? "Unknown",
+      "authorSubscriberCount": (channel["followersCount"] as num?)?.toInt() ?? 0,
+      "authorAvatar": _resolveUrl(channel["avatar"]?["path"]?.toString()),
+      "actors": [],
+      "description": data["description"]?.toString() ?? "",
+      "viewsTotal": (data["views"] as num?)?.toInt() ?? 0,
+      "tags": (data["tags"] as List? ?? []).map((e) => e.toString()).toList(),
+      "categories": [data["category"]?["label"]?.toString() ?? "General"],
+      "uploadDate": (publishedDate?.millisecondsSinceEpoch ?? 0) ~/ 1000,
+      "ratingsPositiveTotal": likes,
+      "ratingsNegativeTotal": dislikes,
+      "ratingsTotal": likes + dislikes,
+      "virtualReality": false,
+      "chapters": {},
+      "rawHtml": response.body,
+    };
+  } catch (e) {
+    return {"iD": videoId, "scrapeFailMessage": e.toString()};
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Thumbnails & Media Downloads
+// ---------------------------------------------------------------------------
+
+Future<String> downloadThumbnail(
+  String uri,
+  Map<String, String>? thumbnailHttpHeaders,
+) async {
+  try {
+    final response = await httpRequest(uri);
+    return response.status == 200 ? response.body : "";
+  } catch (e) {
+    return "";
+  }
+}
+
+Future<List<String>> getProgressThumbnails(
+  String videoID,
+  dynamic rawHtml,
+) async {
+  return [];
+}
+
+void cancelGetProgressThumbnails() {
+  progressThumbnailsCancelled = true;
+}
+
+// ---------------------------------------------------------------------------
+// Comments, Suggestions & Channels
+// ---------------------------------------------------------------------------
+
+Future<List<Map<String, dynamic>>> getVideoSuggestions(
+  String videoID,
+  dynamic rawHtml,
+  int page,
+) async {
+  // Return trending/recent videos as suggestions
+  return getHomePage(page);
+}
+
+String getCommentUriFromID(String commentID, String videoID) =>
+    "$instanceHost/w/$videoID";
+
+Future<List<Map<String, dynamic>>> getComments(
+  String videoID,
+  dynamic rawHtml,
+  int page,
+) async {
+  final start = page * 10;
+  final url = "$instanceHost/api/v1/videos/$videoID/comment-threads?start=$start&count=10";
+
+  try {
+    final response = await httpRequest(url);
+    if (response.status != 200) return [];
+
+    final data = jsonDecode(response.body) as Map<String, dynamic>;
+    final List threads = data["data"] as List? ?? [];
+
+    return threads.map((item) {
+      final comment = item as Map<String, dynamic>;
+      final account = comment["account"] as Map<String, dynamic>? ?? {};
+
+      DateTime? created;
+      if (comment["createdAt"] != null) {
+        created = DateTime.tryParse(comment["createdAt"].toString());
+      }
+
+      return {
+        "iD": comment["id"]?.toString() ?? "",
+        "videoID": videoID,
+        "author": account["displayName"] ?? account["name"] ?? "Anonymous",
+        "commentBody": comment["text"]?.toString() ?? "",
+        "hidden": false,
+        "authorID": account["name"] ?? "",
+        "countryID": "US",
+        "orientation": null,
+        "profilePicture": _resolveUrl(account["avatar"]?["path"]?.toString()),
+        "ratingsPositiveTotal": null,
+        "ratingsNegativeTotal": null,
+        "ratingsTotal": 0,
+        "commentDate": (created?.millisecondsSinceEpoch ?? 0) ~/ 1000,
+        "replyComments": [],
+        "scrapeFailMessage": null,
+      };
+    }).toList();
+  } catch (e) {
+    return [];
+  }
+}
+
+String getAuthorUriFromID(String authorID) => "$instanceHost/c/$authorID";
+
+Future<Map<String, dynamic>> getAuthorPage(String authorID) async {
+  final url = "$instanceHost/api/v1/video-channels/$authorID";
+
+  try {
+    final response = await httpRequest(url);
+    if (response.status != 200) {
+      return {"iD": authorID, "name": authorID};
+    }
+
+    final data = jsonDecode(response.body) as Map<String, dynamic>;
+
+    return {
+      "iD": authorID,
+      "name": data["displayName"] ?? data["name"] ?? authorID,
+      "avatar": _resolveUrl(data["avatar"]?["path"]?.toString()),
+      "banner": _resolveUrl(data["banner"]?["path"]?.toString()),
+      "aliases": [],
+      "description": data["description"]?.toString() ?? "",
+      "advancedDescription": {},
+      "externalLinks": {},
+      "viewsTotal": (data["views"] as num?)?.toInt() ?? 0,
+      "videosTotal": 0,
+      "subscribers": (data["followersCount"] as num?)?.toInt() ?? 0,
+      "rank": 0,
+      "rawHtml": response.body,
+    };
+  } catch (e) {
+    return {"iD": authorID, "name": authorID};
+  }
+}
+
+Future<List<Map<String, dynamic>>> getAuthorVideos(
+  String authorID,
+  int page,
+) async {
+  final start = page * pageSize;
+  final url = "$instanceHost/api/v1/video-channels/$authorID/videos?start=$start&count=$pageSize";
+
+  try {
+    final response = await httpRequest(url);
+    if (response.status != 200) return [];
+
+    final data = jsonDecode(response.body) as Map<String, dynamic>;
+    final List items = data["data"] as List? ?? [];
+
+    return items.map((item) => _formatVideoItem(item as Map<String, dynamic>)).toList();
+  } catch (e) {
+    consoleLog("error", "getAuthorVideos failed: $e");
+    return [];
+  }
+}
   final args = uri.queryParameters;
 
   switch (uri.path) {
